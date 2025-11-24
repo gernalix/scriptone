@@ -131,6 +131,53 @@ def drop_trigger_if_exists(conn: sqlite3.Connection, name: str):
     if row:
         conn.execute(f'DROP TRIGGER "{name}"')
 
+
+def ensure_audit_infrastructure(conn: sqlite3.Connection) -> None:
+    """Crea (se mancanti) le tabelle di audit_dml e audit_schema.
+    Lo schema è compatibile con quello già presente in noutput.db.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_dml (
+            id INTEGER PRIMARY KEY,
+            ts TEXT NOT NULL,
+            action TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            rowid INTEGER,
+            old_values TEXT,
+            new_values TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_schema (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT DEFAULT (CURRENT_TIMESTAMP),
+            action TEXT NOT NULL,
+            table_name TEXT,
+            details TEXT
+        )
+        """
+    )
+
+
+def log_schema_change(conn: sqlite3.Connection, action: str, table_name: Optional[str], details: dict) -> None:
+    """Registra un evento di modifica schema di alto livello in audit_schema.
+
+    Viene chiamata solo dalle operazioni "logiche" (crea tabella, rinomina,
+    ricostruzione tabella), non dai passi interni come le tabelle __tmp__rebuild.
+    """
+    try:
+        ensure_audit_infrastructure(conn)
+        conn.execute(
+            "INSERT INTO audit_schema(action, table_name, details) VALUES (?, ?, ?)",
+            (action, table_name, json.dumps(details, ensure_ascii=False, sort_keys=True)),
+        )
+    except Exception as e:
+        # L'audit non deve mai bloccare l'operazione principale
+        print(f"[WARN] Impossibile scrivere in audit_schema: {e}")
+
 # --------------------------- Diagnostica errori ---------------------------
 
 def _fk_violations_report(conn: sqlite3.Connection, table: str, limit: int = 10) -> str:
@@ -198,9 +245,9 @@ def render_triggers_sql(template: str, table: str, cols: List[str], logseq_col: 
 
     ctx = {
         "table": table,
-        "trigger_name_insert": f'audit__{table}__insert',
-        "trigger_name_update": f'audit__{table}__update',
-        "trigger_name_delete": f'audit__{table}__delete',
+        "trigger_name_insert": f'audit_{table}_insert',
+        "trigger_name_update": f'audit_{table}_update',
+        "trigger_name_delete": f'audit_{table}_delete',
         "trigger_name_logseq": f'set_logseq_random__{table}',  # compat, verrà rimosso
         "json_new_pairs": json_new_pairs,
         "json_old_pairs": json_old_pairs,
@@ -221,13 +268,21 @@ def apply_triggers_to_table(conn: sqlite3.Connection, table: str):
     template = read_triggers_template()
     sql = render_triggers_sql(template, table, cols, logseq_col="logseq")
 
+    # Nomi vecchi (compatibilità) + nuovi nomi semplificati
     trig_names = [
+        # vecchi nomi
         f'audit__{table}__insert',
         f'audit__{table}__update',
         f'audit__{table}__delete',
-        f'set_logseq_random__{table}'
+        # nuovi nomi
+        f'audit_{table}_insert',
+        f'audit_{table}_update',
+        f'audit_{table}_delete',
+        # vecchio trigger logseq (rimosso dal template ma lo droppiamo se esiste)
+        f'set_logseq_random__{table}',
     ]
     with conn:
+        ensure_audit_infrastructure(conn)
         for tn in trig_names:
             drop_trigger_if_exists(conn, tn)
         conn.executescript(sql)
@@ -285,6 +340,12 @@ def create_table_with_columns(conn: sqlite3.Connection, table: str, cols_spec: L
     fk_defs = [f'FOREIGN KEY ("{c}") REFERENCES "{rt}"("{rc}")' for (c, rt, rc) in fks]
     ddl = f'CREATE TABLE "{table}" (\n  ' + ",\n  ".join(col_defs + fk_defs) + "\n);"
     conn.execute(ddl)
+    log_schema_change(
+        conn,
+        action="CREATE_TABLE",
+        table_name=table,
+        details={"columns": cols_spec, "foreign_keys": fks},
+    )
     conn.commit()
 
 # --------------------------- FK utils ---------------------------
@@ -446,6 +507,16 @@ def recreate_table_with_mapping(conn: sqlite3.Connection, table: str,
     idx_sqls = get_index_create_statements(conn, table)
 
     copy_cols = ["id","logseq"] + new_order
+    log_schema_change(
+        conn,
+        action="REBUILD_TABLE",
+        table_name=table,
+        details={
+            "new_order": new_order,
+            "type_overrides": type_overrides,
+            "add_fk_cols": add_fk_cols,
+        },
+    )
     generic_rebuild(conn, table, new_defs, fk_clause, copy_cols, idx_sqls)
 
 # --------------------------- Menu: Aggiungi tabella ---------------------------
@@ -507,6 +578,12 @@ def _rename_table_and_update_triggers(conn: sqlite3.Connection, old: str, new: s
     with conn:
         conn.execute(f'ALTER TABLE "{old}" RENAME TO "{new}"')
         print(f"[OK] Tabella rinominata: {old} → {new}")
+        log_schema_change(
+            conn,
+            action="RENAME_TABLE",
+            table_name=new,
+            details={"old_name": old, "new_name": new},
+        )
         apply_triggers_to_table(conn, new)
 
         # Aggiorna i trigger testuali nel DB
@@ -531,6 +608,12 @@ def _rename_columns_simple(conn: sqlite3.Connection, table: str, mapping: List[T
         for old, new in mapping:
             print(f"[INFO] Rinomino colonna: {old} → {new}")
             conn.execute(f'ALTER TABLE "{table}" RENAME COLUMN "{old}" TO "{new}"')
+        log_schema_change(
+            conn,
+            action="RENAME_COLUMNS",
+            table_name=table,
+            details={"mapping": mapping},
+        )
         apply_triggers_to_table(conn, table)
     print("[FATTO] Rinomina colonne completata.")
 
