@@ -1,6 +1,7 @@
-# memento_sdk.py — list endpoints now request full fields in one go.
-# Minimal, conservative patch: adds params.setdefault("include","fields") in list calls.
-# If your API uses a different keyword, uncomment "expand" or "full" lines below.
+# v2
+# memento_sdk.py — robust config + token handling + backward-compatible API for scriptone
+
+from __future__ import annotations
 
 from typing import Dict, Any, List, Optional, Callable
 import time
@@ -11,66 +12,99 @@ import re
 import requests
 import certifi
 
+# ---------------------------------------------------------------------
+# SSL env cleanup (kept from your original file)
+# ---------------------------------------------------------------------
 for var in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE"):
     os.environ.pop(var, None)
 
-os.environ["SSL_CERT_FILE"] = certifi.where()
+# ---------------------------------------------------------------------
+# Base dir: ALWAYS the folder containing this file (fixes double-click / CWD issues)
+# ---------------------------------------------------------------------
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-
-# -----------------------
-# Config helpers
-# -----------------------
-
+# ---------------------------------------------------------------------
+# Config reading
+# ---------------------------------------------------------------------
 def _cfg_get(key: str, default=None):
     """
-    Read settings from environment or from settings.yaml/.yml/.ini (if present).
-    Looks for keys under any section; accepts both 'memento.token' and 'token' naming.
-    """
-    try:
-        import configparser, yaml  # type: ignore
-    except Exception:
-        configparser = None
-        yaml = None
+    Read settings from environment or from settings.yaml/.yml/.ini in the SAME folder as this script.
 
+    Keys are expected as 'section.option' (e.g., 'memento.token').
+    For INI:
+      [memento]
+      token = ...
+    Also supports scanning other sections for last 'token' if needed.
+
+    ENV mapping supported:
+      MEMENTO_TOKEN, MEMENTO_API_URL, MEMENTO_TIMEOUT
+    """
+    # 1) ENV (only if non-empty)
     env_map = {
         "memento.token": "MEMENTO_TOKEN",
         "memento.api_url": "MEMENTO_API_URL",
         "memento.timeout": "MEMENTO_TIMEOUT",
     }
-    if key in env_map and env_map[key] in os.environ:
-        return os.environ[env_map[key]]
+    if key in env_map:
+        ev = (os.environ.get(env_map[key]) or "").strip()
+        if ev:
+            return ev
 
+    # 2) Import config libs safely (do NOT couple configparser with yaml)
+    try:
+        import configparser
+    except Exception:
+        configparser = None
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None
+
+    # 3) Read settings from script folder (robust)
     for fn in ("settings.yaml", "settings.yml", "settings.ini"):
-        if not os.path.exists(fn):
+        path = os.path.join(_BASE_DIR, fn)
+        if not os.path.exists(path):
             continue
         try:
             if fn.endswith(".ini") and configparser:
                 cp = configparser.ConfigParser()
-                cp.read(fn, encoding="utf-8")
-                # try exact section.key match, else scan all sections for the last token
+                cp.read(path, encoding="utf-8")
+
+                # exact section.option
                 if "." in key:
                     sect, opt = key.split(".", 1)
                     if cp.has_section(sect) and cp.has_option(sect, opt):
                         return cp.get(sect, opt)
-                opt = key.split(".")[-1]
+
+                # fallback: scan all sections for opt name
+                opt_name = key.split(".", 1)[-1]
+                last = None
                 for sect in cp.sections():
-                    if cp.has_option(sect, opt):
-                        return cp.get(sect, opt)
-            elif yaml:
-                with open(fn, "r", encoding="utf-8") as fh:
-                    y = yaml.safe_load(fh) or {}
-                if isinstance(y, dict):
-                    # try deep traversal by last token
-                    opt = key.split(".")[-1]
-                    for sect, vals in y.items():
-                        if isinstance(vals, dict) and opt in vals:
-                            return vals[opt]
-                    # also allow top-level direct key
-                    if key in y:
-                        return y[key]
+                    if cp.has_option(sect, opt_name):
+                        last = cp.get(sect, opt_name)
+                if last is not None:
+                    return last
+
+            elif (fn.endswith(".yaml") or fn.endswith(".yml")) and yaml:
+                with open(path, "r", encoding="utf-8") as f:
+                    y = yaml.safe_load(f) or {}
+
+                # nested section dict
+                if "." in key:
+                    sect, opt = key.split(".", 1)
+                    if isinstance(y, dict) and isinstance(y.get(sect), dict) and opt in y[sect]:
+                        return y[sect][opt]
+
+                # direct key
+                if isinstance(y, dict) and key in y:
+                    return y[key]
         except Exception:
+            # ignore bad config files
             continue
+
     return default
+
 
 def _sanitize_url(url: str) -> str:
     if not url:
@@ -78,32 +112,51 @@ def _sanitize_url(url: str) -> str:
     url = re.split(r"[;#]", str(url), maxsplit=1)[0].strip()
     return re.sub(r"\s+", "", url)
 
-def _base_url() -> str:
-    # Default Memento Cloud v1; adjust if your account uses a different base
-    u = _cfg_get("memento.api_url", "https://api.mementodatabase.com/v1")
-    return _sanitize_url(u or "")
 
-def _timeout() -> int:
+def _base_url() -> str:
+    # Default Memento Cloud v1
+    return _sanitize_url(_cfg_get("memento.api_url", "https://api.mementodatabase.com/v1"))
+
+
+def _timeout() -> float:
     try:
-        return int(_cfg_get("memento.timeout", 20))
+        return float(_cfg_get("memento.timeout", 20))
     except Exception:
-        return 20
+        return 20.0
+
+
+def _get_token_required() -> str:
+    token = (_cfg_get("memento.token", "") or "").strip()
+    if not token:
+        raise RuntimeError(
+            "MEMENTO token mancante. Metti in settings.ini:\n"
+            "[memento]\n"
+            "token = <IL_TUO_TOKEN>\n"
+            f"(File letto da: {_BASE_DIR}\\settings.ini)"
+        )
+    return token
+
 
 def _token_params() -> Dict[str, Any]:
-    token = (_cfg_get("memento.token", "") or "").strip()
-    return {"token": token} if token else {}
+    # ALWAYS return token (or raise)
+    return {"token": _get_token_required()}
 
-# -----------------------
+
+# ---------------------------------------------------------------------
 # HTTP with gentle backoff
-# -----------------------
-
+# ---------------------------------------------------------------------
 def _get_with_backoff(url, *, params=None, timeout=None, max_tries=12, base_sleep=1, max_sleep=30.0):
     import random
     tries = 0
     last_exc = None
     while tries < max_tries:
         try:
-            r = requests.get(url, params=params or {}, timeout=timeout or _timeout())
+            r = requests.get(
+                url,
+                params=params or {},
+                timeout=timeout or _timeout(),
+                verify=certifi.where(),
+            )
             # Return on success or common client errors (let caller handle them)
             if r.status_code < 400 or r.status_code in (400, 401, 403, 404):
                 return r
@@ -121,146 +174,212 @@ def _get_with_backoff(url, *, params=None, timeout=None, max_tries=12, base_slee
                 tries += 1
                 continue
             return r
-        except requests.RequestException as ex:
-            last_exc = ex
+        except Exception as e:
+            last_exc = e
             time.sleep(min(max_sleep, base_sleep * (2 ** tries)))
             tries += 1
-            continue
+
     if last_exc:
         raise last_exc
-    return r
+    raise RuntimeError("HTTP request failed (unknown)")
+
 
 def _raise_on_404(r, where: str):
     if r.status_code == 404:
         raise RuntimeError(f"Memento API 404 su {where}: {r.text}")
     r.raise_for_status()
 
-# -----------------------
-# Public API
-# -----------------------
 
+# ---------------------------------------------------------------------
+# Public API (used by scriptone)
+# ---------------------------------------------------------------------
 def list_libraries() -> List[Dict[str, Any]]:
     base = _base_url().rstrip("/")
     url = f"{base}/libraries"
-    r = _get_with_backoff(url, params=_token_params(), timeout=_timeout())
-    _raise_on_404(r, "/libraries")
-    data = r.json()
-    libs = data.get("libraries") or data.get("items") or data
-    if isinstance(libs, dict):
-        libs = list(libs.values())
-    out = []
-    for it in libs or []:
-        out.append({
-            "id": it.get("id") or it.get("library_id") or it.get("uuid"),
-            "name": it.get("name") or it.get("title"),
-            "title": it.get("title") or it.get("name"),
-        })
-    return out
+    params = _token_params().copy()
+    r = _get_with_backoff(url, params=params)
+    _raise_on_404(r, "list_libraries")
+    return r.json()
 
-def fetch_all_entries_full(library_id: str, limit: int = 100, progress: Optional[Callable[[Dict[str, Any]], None]] = None) -> List[Dict[str, Any]]:
+
+def fetch_all_entries_full(
+    library_id: str,
+    *,
+    limit: int = 100,
+    progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    max_pages: int = 0,
+) -> List[Dict[str, Any]]:
     """
-    Fetches all entries of a library, requesting full fields directly from the LIST endpoint.
+    Fetch ALL entries in a library, paging until done.
+    Keeps include=fields so the caller gets full field payloads.
     """
     base = _base_url().rstrip("/")
     url = f"{base}/libraries/{library_id}/entries"
-
-    params = _token_params().copy()
-    params["limit"] = int(limit)
-    # >>> Patch: ask the API to include fields directly in the list response
-    params.setdefault("include", "fields")
-    # If your API ignores 'include', try one of the following (one at a time):
-    # params.setdefault("expand", "fields")
-    # params.setdefault("full", "1")
 
     all_rows: List[Dict[str, Any]] = []
     page = 0
+
+    params = _token_params().copy()
+    params["limit"] = int(limit)
+    params.setdefault("include", "fields")
+
     while True:
-        t0 = time.perf_counter()
-        r = _get_with_backoff(url, params=params, timeout=_timeout())
-        dt = round(time.perf_counter() - t0, 3)
-        _raise_on_404(r, url)
+        if max_pages and page >= max_pages:
+            break
+
+        t0 = time.time()
+        r = _get_with_backoff(url, params=params)
+        _raise_on_404(r, f"fetch_all_entries_full({library_id})")
         data = r.json()
-        rows = data.get("entries") or data.get("items") or data.get("data") or []
+        dt = round(time.time() - t0, 3)
+
+        rows = data.get("entries") or data.get("data") or []
         if isinstance(rows, dict):
             rows = list(rows.values())
         all_rows.extend(rows)
+
         page += 1
         if progress:
             progress({"event": "page", "library_id": library_id, "page": page, "rows": len(rows), "sec": dt})
+
         token = data.get("nextPageToken") or data.get("cursor")
         if token:
             params = _token_params().copy()
             params["limit"] = int(limit)
-            params.setdefault("include", "fields")  # keep asking for fields
-            # params.setdefault("expand", "fields")
-            # params.setdefault("full", "1")
+            params.setdefault("include", "fields")
             params["pageToken"] = token
             continue
         break
+
     return all_rows
 
-def fetch_incremental(library_id: str, *, modified_after_iso: Optional[str], limit: int = 200, progress: Optional[Callable[[Dict[str, Any]], None]] = None) -> List[Dict[str, Any]]:
+
+def fetch_incremental(
+    library_id: str,
+    *,
+    updated_after: str,
+    limit: int = 100,
+    progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    probe: int = 0,
+    max_pages: int = 0,
+) -> List[Dict[str, Any]]:
     """
-    Incremental fetch using updatedAfter/modifiedAfter if available, requesting full fields from LIST.
+    Fetch entries updated after a given timestamp (incremental sync).
+    Uses updatedAfter + include=fields, paging until done.
     """
     base = _base_url().rstrip("/")
     url = f"{base}/libraries/{library_id}/entries"
 
+    all_rows: List[Dict[str, Any]] = []
+    page = 0
+
     params = _token_params().copy()
     params["limit"] = int(limit)
-    if modified_after_iso:
-        # Some APIs use 'updatedAfter', others 'modifiedAfter'
-        params["updatedAfter"] = modified_after_iso
-
-    # >>> Patch: request fields inline
+    params["updatedAfter"] = updated_after
     params.setdefault("include", "fields")
-    # params.setdefault("expand", "fields")
-    # params.setdefault("full", "1")
 
-    rows: List[Dict[str, Any]] = []
-    page = 0
+    # optional small probe
+    if probe and probe > 0:
+        params_probe = dict(params)
+        params_probe["limit"] = int(min(limit, probe))
+        r_probe = _get_with_backoff(url, params=params_probe)
+        _raise_on_404(r_probe, f"fetch_incremental.probe({library_id})")
+        # don't early return; probe is just to test the endpoint quickly
+
     while True:
-        t0 = time.perf_counter()
-        r = _get_with_backoff(url, params=params, timeout=_timeout())
-        dt = round(time.perf_counter() - t0, 3)
-        _raise_on_404(r, url)
+        if max_pages and page >= max_pages:
+            break
+
+        t0 = time.time()
+        r = _get_with_backoff(url, params=params)
+        _raise_on_404(r, f"fetch_incremental({library_id})")
         data = r.json()
-        chunk = data.get("entries") or data.get("items") or data.get("data") or []
-        if isinstance(chunk, dict):
-            chunk = list(chunk.values())
-        rows.extend(chunk)
+        dt = round(time.time() - t0, 3)
+
+        rows = data.get("entries") or data.get("data") or []
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        all_rows.extend(rows)
+
         page += 1
         if progress:
-            ev = {"event": "page", "library_id": library_id, "page": page, "rows": len(chunk), "sec": dt}
-            if modified_after_iso:
-                ev["updatedAfter"] = modified_after_iso
-            progress(ev)
-        time.sleep( float(_cfg_get("memento.page_delay_s", 1)) )
+            progress({"event": "page", "library_id": library_id, "page": page, "rows": len(rows), "sec": dt})
+
         token = data.get("nextPageToken") or data.get("cursor")
         if token:
             params = _token_params().copy()
             params["limit"] = int(limit)
-            if modified_after_iso:
-                params["updatedAfter"] = modified_after_iso
+            params["updatedAfter"] = updated_after
             params.setdefault("include", "fields")
-            # params.setdefault("expand", "fields")
-            # params.setdefault("full", "1")
             params["pageToken"] = token
             continue
         break
-    return rows
 
-def fetch_entry_detail(library_id: str, entry_id: str) -> Optional[Dict[str, Any]]:
+    return all_rows
+
+
+def fetch_entry_detail(library_id: str, entry_id: str) -> Dict[str, Any]:
     """
-    Per-entry detail (kept for compatibility / fallbacks). Prefer list calls with include=fields.
+    Fetch a single entry detail. Some accounts expose /entries/<id>.
     """
     base = _base_url().rstrip("/")
     url = f"{base}/libraries/{library_id}/entries/{entry_id}"
-    r = _get_with_backoff(url, params=_token_params(), timeout=_timeout())
-    if r.status_code == 404:
-        return None
-    _raise_on_404(r, url)
+
+    params = _token_params().copy()
+    params.setdefault("include", "fields")
+
+    r = _get_with_backoff(url, params=params)
+    _raise_on_404(r, f"fetch_entry_detail({library_id},{entry_id})")
+    return r.json()
+
+
+def probe_capabilities(library_id: str) -> Dict[str, Any]:
+    """
+    Best-effort probe: checks which incremental params are accepted.
+    Returns booleans for updatedAfter/createdAfter and whether include=fields works.
+    """
+    base = _base_url().rstrip("/")
+    url = f"{base}/libraries/{library_id}/entries"
+
+    out: Dict[str, Any] = {
+        "updatedAfter": False,
+        "createdAfter": False,
+        "include_fields": False,
+    }
+
+    # include=fields
     try:
-        return r.json()
+        p = _token_params().copy()
+        p["limit"] = 1
+        p["include"] = "fields"
+        r = _get_with_backoff(url, params=p, max_tries=3)
+        if r.status_code < 400:
+            out["include_fields"] = True
     except Exception:
-        return None
+        pass
+
+    # updatedAfter (use an ancient timestamp)
+    try:
+        p = _token_params().copy()
+        p["limit"] = 1
+        p["updatedAfter"] = "1970-01-01T00:00:00.000Z"
+        p.setdefault("include", "fields")
+        r = _get_with_backoff(url, params=p, max_tries=3)
+        if r.status_code < 400:
+            out["updatedAfter"] = True
+    except Exception:
+        pass
+
+    # createdAfter (some APIs support it)
+    try:
+        p = _token_params().copy()
+        p["limit"] = 1
+        p["createdAfter"] = "1970-01-01T00:00:00.000Z"
+        p.setdefault("include", "fields")
+        r = _get_with_backoff(url, params=p, max_tries=3)
+        if r.status_code < 400:
+            out["createdAfter"] = True
+    except Exception:
+        pass
+
+    return out

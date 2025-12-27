@@ -4,6 +4,13 @@ import os
 from pathlib import Path
 os.chdir(Path(__file__).resolve().parent)
 
+import  sys
+print("PY=", sys.executable)
+print("CWD=", os.getcwd())
+print("MEMENTO_TOKEN env=", repr(os.environ.get("MEMENTO_TOKEN")))
+input("ENTER...")
+
+
 import sys
 import sqlite3
 from pathlib import Path
