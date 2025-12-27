@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 # crea_tabelle.py — versione completa con menu Modifica, sweep tmp, rebuild safe e diagnostica
+import os
+from pathlib import Path
+os.chdir(Path(__file__).resolve().parent)
 
 import sys
 import sqlite3
