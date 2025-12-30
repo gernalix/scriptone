@@ -1,49 +1,64 @@
-# v1.1
-# Patch: accept modified_after_iso alias for incremental fetch
+# v4.0
+"""Apply in-place compatibility fixes to scriptone's memento_sdk.py.
 
-def fetch_incremental(*, modified_after=None, modified_after_iso=None, **kwargs):
-    # alias handling
-    if modified_after is None and modified_after_iso is not None:
-        modified_after = modified_after_iso
+Adds/ensures at EOF:
+- fetch_all_entries_full alias
+- fetch_entry_detail alias
+- fetch_incremental wrapper that:
+  * accepts modified_after_iso
+  * accepts positional args even if the underlying implementation is keyword-only
+    by mapping positional args onto parameter names using inspect.signature.
 
-    # NOTE:
-    # existing implementation logic should follow here.
-    # This wrapper keeps backward compatibility with callers
-    # passing modified_after_iso.
+Usage (from the scriptone folder):
+    python apply_memento_fix.py
+"""
 
-    # --- ORIGINAL LOGIC BELOW (unchanged) ---
-    return _fetch_incremental_impl(modified_after=modified_after, **kwargs)
+from __future__ import annotations
+
+import re
+import shutil
+from pathlib import Path
+
+SDK_FILE = Path(__file__).with_name("memento_sdk.py")
+BACKUP_FILE = Path(__file__).with_name("memento_sdk.py.bak")
 
 
-# rename original implementation (existing code should already be here)
-def _fetch_incremental_impl(**kwargs):
-    raise NotImplementedError("Replace this stub with original fetch_incremental body")
+def _has_def(src: str, name: str) -> bool:
+    return re.search(rf"^\s*def\s+{re.escape(name)}\s*\(", src, flags=re.M) is not None
 
+
+def main() -> None:
+    if not SDK_FILE.exists():
+        raise SystemExit(f"ERROR: {SDK_FILE} not found. Run this from your scriptone folder.")
+
+    src = SDK_FILE.read_text(encoding="utf-8", errors="replace")
+
+    # Backup once (do not overwrite an existing backup)
+    if not BACKUP_FILE.exists():
+        shutil.copyfile(SDK_FILE, BACKUP_FILE)
+
+    additions = []
+
+    if not _has_def(src, "fetch_all_entries_full"):
+        additions.append(r'''
 # --- compat: fetch_all_entries_full (alias) ---
 def fetch_all_entries_full(*args, **kwargs):
-    """Backwards-compatible alias.
-
-    Older callers import fetch_all_entries_full; newer SDKs may expose fetch_all_entries
-    (or a similarly named function). This keeps the import stable.
-    """
-    if "fetch_all_entries" in globals() and callable(globals()["fetch_all_entries"]):
-        return globals()["fetch_all_entries"](*args, **kwargs)
-    if "fetch_all_entries_paginated" in globals() and callable(globals()["fetch_all_entries_paginated"]):
-        return globals()["fetch_all_entries_paginated"](*args, **kwargs)
-    if "fetch_all_entries_all" in globals() and callable(globals()["fetch_all_entries_all"]):
-        return globals()["fetch_all_entries_all"](*args, **kwargs)
+    """Backwards-compatible alias for older callers."""
+    for name in ("fetch_all_entries", "fetch_all_entries_paginated", "fetch_all_entries_all"):
+        fn = globals().get(name)
+        if callable(fn):
+            return fn(*args, **kwargs)
     raise AttributeError(
         "fetch_all_entries_full alias could not find an underlying implementation. "
         "Expected one of: fetch_all_entries, fetch_all_entries_paginated, fetch_all_entries_all."
     )
+''')
 
+    if not _has_def(src, "fetch_entry_detail"):
+        additions.append(r'''
 # --- compat: fetch_entry_detail (alias) ---
 def fetch_entry_detail(*args, **kwargs):
-    """Backwards-compatible alias.
-
-    Older code imports fetch_entry_detail; SDK variants may expose e.g. fetch_entry_details,
-    fetch_entry, get_entry_detail, or similar.
-    """
+    """Backwards-compatible alias for older callers."""
     for name in ("fetch_entry_details", "fetch_entry_detail_full", "fetch_entry", "get_entry_detail", "get_entry"):
         fn = globals().get(name)
         if callable(fn):
@@ -52,7 +67,10 @@ def fetch_entry_detail(*args, **kwargs):
         "fetch_entry_detail alias could not find an underlying implementation. "
         "Expected one of: fetch_entry_details, fetch_entry_detail_full, fetch_entry, get_entry_detail, get_entry."
     )
+''')
 
+    # Always (re-)add a smarter wrapper; it will override earlier simplistic wrappers safely.
+    additions.append(r'''
 # --- compat: smart wrapper for fetch_incremental (modified_after_iso + positional args) ---
 import inspect as _inspect
 
@@ -98,4 +116,13 @@ def fetch_incremental(*args, modified_after_iso=None, **kwargs):  # type: ignore
             kwargs["modified_after"] = modified_after_iso
 
     return fn(*args, **kwargs)
+''')
 
+    patched = src.rstrip() + "\n\n" + "\n".join(additions).lstrip() + "\n"
+    SDK_FILE.write_text(patched, encoding="utf-8")
+    print("OK: Applied fixes to memento_sdk.py")
+    print(f"Backup saved as: {BACKUP_FILE.name}")
+
+
+if __name__ == "__main__":
+    main()
